@@ -45,6 +45,7 @@ import (
 	"github.com/argoproj/argo-cd/v2/util/rbac"
 	settings_util "github.com/argoproj/argo-cd/v2/util/settings"
 	testutil "github.com/argoproj/argo-cd/v2/util/test"
+	wimocks "github.com/argoproj/argo-cd/v2/util/workloadidentity/mocks"
 )
 
 type FakeArgoCDServer struct {
@@ -625,7 +626,7 @@ func getTestServer(t *testing.T, anonymousEnabled bool, withFakeSSO bool, useDex
 	})
 	oidcServer := ts
 	if !useDexForSSO {
-		oidcServer = testutil.GetOIDCTestServer(t)
+		oidcServer = testutil.GetOIDCTestServer(t, false)
 	}
 	if withFakeSSO {
 		cm.Data["url"] = ts.URL
@@ -666,9 +667,10 @@ connectors:
 	if withFakeSSO && useDexForSSO {
 		argoCDOpts.DexServerAddr = ts.URL
 	}
+	workloadIdentityMock := new(wimocks.TokenProvider)
 	argocd = NewServer(context.Background(), argoCDOpts, ApplicationSetOpts{})
 	var err error
-	argocd.ssoClientApp, err = oidc.NewClientApp(argocd.settings, argocd.DexServerAddr, argocd.DexTLSConfig, argocd.BaseHRef, cache.NewInMemoryCache(24*time.Hour))
+	argocd.ssoClientApp, err = oidc.NewClientApp(argocd.settings, argocd.DexServerAddr, argocd.DexTLSConfig, argocd.BaseHRef, cache.NewInMemoryCache(24*time.Hour), workloadIdentityMock)
 	require.NoError(t, err)
 	return argocd, oidcServer.URL
 }
