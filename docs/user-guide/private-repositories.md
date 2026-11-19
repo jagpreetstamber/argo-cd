@@ -175,6 +175,9 @@ Using the UI:
 
 ### Azure Container Registry/Azure Repos using Azure Workload Identity
 
+> [!NOTE]
+> ACR workload identity authentication requires an HTTPS Bearer realm on the configured registry's origin (scheme, hostname, and port). Challenge and token-exchange redirects must retain that origin. Tokens are not exchanged with a separate authentication host.
+
 Before using this feature, you must perform the following steps to enable workload identity configuration in Argo CD:
 
 - **Label the Pods:** Add the `azure.workload.identity/use: "true"` label to the repo-server pods.
@@ -283,7 +286,7 @@ To manage credential templates using the CLI, use the `repocreds` sub-command, f
 In order for Argo CD to use a credential template for any given repository, the following conditions must be met:
 
 * The repository must either not be configured at all, or if configured, must not contain any credential information 
-* The URL configured for a credential template (e.g. `https://github.com/argoproj`) must match as prefix for the repository URL (e.g. `https://github.com/argoproj/argocd-example-apps`). 
+* The URL configured for a credential template must match the repository's scheme, hostname, and port. Its path must match exactly or end at a path-segment boundary: `https://github.com/argoproj` matches `https://github.com/argoproj/argocd-example-apps`, but not `https://github.com/argoproj-other/repo` or `https://github.com.attacker.example/argoproj/repo`. HTTP(S) paths are case-sensitive. Scheme-less OCI registry URLs and `oci://` URLs use HTTPS for credential matching.
 
 > [!NOTE]
 > Repositories that require authentication can be added using CLI or Web UI without specifying credentials only after a matching repository credential has been set up
@@ -543,6 +546,9 @@ This environment variable applies globally to all Helm repository requests.
 ## Git Submodules
 
 Submodules are supported and will be picked up automatically. If the submodule repository requires authentication then the credentials will need to match the credentials of the parent repository. Set ARGOCD_GIT_MODULES_ENABLED=false to disable submodule support
+
+> [!NOTE]
+> Git bearer authorization headers, including Azure workload identity and service-principal tokens, are limited to the parent repository's HTTP(S) origin. Submodules on a different scheme, hostname, or port do not receive that header or the Azure token through a credential prompt. Private cross-origin submodules require independent authentication; a repository credential template alone does not configure credentials for recursive Git submodule commands.
 
 ## Declarative Configuration
 

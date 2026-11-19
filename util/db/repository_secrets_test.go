@@ -659,6 +659,31 @@ func TestSecretsRepositoryBackend_GetRepoCreds(t *testing.T) {
 	}
 }
 
+func TestRepositoryCredentialIndexBoundaries(t *testing.T) {
+	t.Parallel()
+	credentials := []*corev1.Secret{
+		{Data: map[string][]byte{"url": []byte("registry.azurecr.io")}},
+		{Data: map[string][]byte{"url": []byte("registry.azurecr.io/charts")}},
+	}
+	backend := &secretsRepositoryBackend{}
+	for _, tt := range []struct {
+		url   string
+		index int
+	}{
+		{"registry.azurecr.io/charts/app", 1},
+		{"registry.azurecr.io/charts-evil/app", 0},
+		{"registry.azurecr.io.attacker.example/charts/app", -1},
+		{"registry.azurecr.io@attacker.example/charts/app", -1},
+		{"registry.azurecr.io:8443/charts/app", -1},
+		{"oci://registry.azurecr.io/charts/app", 1},
+	} {
+		t.Run(tt.url, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.index, backend.getRepositoryCredentialIndex(credentials, tt.url))
+		})
+	}
+}
+
 func TestSecretToRepoCred_AzureServicePrincipalKeyAliases(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -4285,6 +4285,46 @@ func TestGetHelmRepos_OCIHelmDependenciesWithHelmRepo(t *testing.T) {
 	assert.Equal(t, "example.com/myrepo", helmRepos[0].Repo)
 }
 
+func TestGetHelmRepos_CredentialBoundaries(t *testing.T) {
+	t.Parallel()
+	for _, nativeOCI := range []bool{false, true} {
+		for _, template := range []bool{false, true} {
+			for _, credentialURL := range []string{
+				"example.com",
+				"example.com/myrepo",
+				"example.com/myrepo/private",
+				"example.com.evil",
+				"example.com:8443",
+				"example.com/my",
+			} {
+				t.Run(fmt.Sprintf("native=%t/template=%t/%s", nativeOCI, template, credentialURL), func(t *testing.T) {
+					t.Parallel()
+					repoType := "helm"
+					if nativeOCI {
+						repoType = "oci"
+						credentialURL = "oci://" + credentialURL
+					}
+					var repos []*v1alpha1.Repository
+					var templates []*v1alpha1.RepoCreds
+					if template {
+						templates = []*v1alpha1.RepoCreds{{URL: credentialURL, Type: repoType, EnableOCI: !nativeOCI, Username: "canary", Password: "canary"}}
+					} else {
+						repos = []*v1alpha1.Repository{{Repo: credentialURL, Type: repoType, EnableOCI: !nativeOCI, Username: "canary", Password: "canary"}}
+					}
+					helmRepos, err := getHelmRepos("./testdata/oci-dependencies", repos, templates)
+					require.NoError(t, err)
+					require.Len(t, helmRepos, 1)
+					if strings.TrimPrefix(credentialURL, "oci://") == "example.com" || strings.TrimPrefix(credentialURL, "oci://") == "example.com/myrepo" {
+						assert.Equal(t, "canary", helmRepos[0].GetUsername())
+					} else {
+						assert.Empty(t, helmRepos[0].GetUsername())
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestGetHelmRepos_OCIHelmDependenciesWithRepo(t *testing.T) {
 	q := apiclient.ManifestRequest{Repos: []*v1alpha1.Repository{{Repo: "example.com", Username: "test", Password: "test", EnableOCI: true}}, HelmRepoCreds: []*v1alpha1.RepoCreds{}}
 

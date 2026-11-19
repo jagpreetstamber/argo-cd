@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,13 +98,15 @@ func TestGetPasswordShouldGenerateTokenIfNotPresentInCache(t *testing.T) {
 
 func TestChallengeAzureContainerRegistry(t *testing.T) {
 	t.Parallel()
+	var registryURL string
 	// Set up the mock server
 	mockServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/v2/", r.URL.Path)
-		w.Header().Set("Www-Authenticate", `Bearer realm="https://login.microsoftonline.com/",service="registry.example.com"`)
+		w.Header().Set("Www-Authenticate", fmt.Sprintf(`Bearer realm=%q, service="registry.example.com"`, registryURL+"/oauth2/token"))
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer mockServer.Close()
+	registryURL = mockServer.URL
 
 	workloadIdentityMock := &mocks.TokenProvider{}
 	creds := NewAzureWorkloadIdentityCreds(mockServer.URL[8:], "", nil, nil, true, workloadIdentityMock)
@@ -111,7 +115,7 @@ func TestChallengeAzureContainerRegistry(t *testing.T) {
 	require.NoError(t, err)
 
 	expectedParams := map[string]string{
-		"realm":   "https://login.microsoftonline.com/",
+		"realm":   registryURL + "/oauth2/token",
 		"service": "registry.example.com",
 	}
 	assert.Equal(t, expectedParams, tokenParams)
@@ -192,7 +196,7 @@ func TestChallengeAzureContainerRegistryNoRealm(t *testing.T) {
 func TestGetAccessTokenAfterChallenge_Success(t *testing.T) {
 	t.Parallel()
 	// Mock the server to return a successful response
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mockServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/oauth2/exchange", r.URL.Path)
 
 		response := `{"refresh_token":"newRefreshToken"}`
@@ -219,7 +223,7 @@ func TestGetAccessTokenAfterChallenge_Success(t *testing.T) {
 func TestGetAccessTokenAfterChallenge_Failure(t *testing.T) {
 	t.Parallel()
 	// Mock the server to return an error response
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mockServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/oauth2/exchange", r.URL.Path)
 		w.WriteHeader(http.StatusBadRequest)
 		_, err := w.Write([]byte(`{"error": "invalid_request"}`))
@@ -245,7 +249,7 @@ func TestGetAccessTokenAfterChallenge_Failure(t *testing.T) {
 func TestGetAccessTokenAfterChallenge_MalformedResponse(t *testing.T) {
 	t.Parallel()
 	// Mock the server to return a malformed JSON response
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mockServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/oauth2/exchange", r.URL.Path)
 		w.WriteHeader(http.StatusOK)
 		_, err := w.Write([]byte(`{"refresh_token":`))
@@ -266,6 +270,138 @@ func TestGetAccessTokenAfterChallenge_MalformedResponse(t *testing.T) {
 	refreshToken, err := creds.getAccessTokenAfterChallenge(t.Context(), tokenParams)
 	require.ErrorContains(t, err, "failed to unmarshal response body")
 	assert.Empty(t, refreshToken)
+}
+
+func TestAzureRegistryRejectsForeignRealm(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int32
+	foreign := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer foreign.Close()
+	registry := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Www-Authenticate", fmt.Sprintf(`Bearer realm=%q,service="registry.example.com"`, foreign.URL))
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer registry.Close()
+	provider := &mocks.TokenProvider{}
+	creds := NewAzureWorkloadIdentityCreds(strings.TrimPrefix(registry.URL, "https://"), "", nil, nil, true, provider)
+	_, err := creds.GetAccessToken()
+	require.ErrorContains(t, err, "configured registry HTTPS origin")
+	provider.AssertNotCalled(t, "GetToken", "https://management.core.windows.net/.default")
+	assert.Zero(t, requests.Load())
+
+	for _, realm := range []string{
+		foreign.URL,
+		"http://" + strings.TrimPrefix(registry.URL, "https://"),
+		"https://user@" + strings.TrimPrefix(registry.URL, "https://"),
+		"/oauth2/token",
+		"https://[",
+		"",
+	} {
+		t.Run(realm, func(t *testing.T) {
+			_, err := creds.getAccessTokenAfterChallenge(t.Context(), map[string]string{"realm": realm})
+			require.ErrorContains(t, err, "configured registry HTTPS origin")
+		})
+	}
+}
+
+func TestAzureRegistryRejectsCrossOriginRedirects(t *testing.T) {
+	t.Parallel()
+	for _, exchange := range []bool{false, true} {
+		for _, downgrade := range []bool{false, true} {
+			for _, status := range []int{http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+				t.Run(fmt.Sprintf("exchange=%t/downgrade=%t/status=%d", exchange, downgrade, status), func(t *testing.T) {
+					t.Parallel()
+					var foreignRequests atomic.Int32
+					foreign := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						foreignRequests.Add(1)
+						w.WriteHeader(http.StatusUnauthorized)
+					}))
+					if downgrade {
+						foreign.Start()
+					} else {
+						foreign.StartTLS()
+					}
+					defer foreign.Close()
+					var registryURL string
+					registry := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if exchange && r.URL.Path == "/v2/" {
+							w.Header().Set("Www-Authenticate", fmt.Sprintf(`Bearer realm=%q,service="registry.example.com"`, registryURL))
+							w.WriteHeader(http.StatusUnauthorized)
+							return
+						}
+						http.Redirect(w, r, foreign.URL, status)
+					}))
+					defer registry.Close()
+					registryURL = registry.URL
+					provider := &mocks.TokenProvider{}
+					if exchange {
+						provider.EXPECT().GetToken("https://management.core.windows.net/.default").
+							Return(&workloadidentity.Token{AccessToken: "canary-only-token"}, nil).Once()
+					}
+					creds := NewAzureWorkloadIdentityCreds(strings.TrimPrefix(registry.URL, "https://"), "", nil, nil, true, provider)
+					_, err := creds.GetAccessToken()
+					require.ErrorContains(t, err, "registry redirect must retain")
+					assert.Zero(t, foreignRequests.Load(), "foreign endpoint must not receive the request or token")
+					provider.AssertExpectations(t)
+				})
+			}
+		}
+	}
+}
+
+func TestAzureRegistrySameOriginRedirect(t *testing.T) {
+	t.Parallel()
+	var registryURL string
+	registry := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/":
+			http.Redirect(w, r, "/challenge", http.StatusFound)
+		case "/challenge":
+			w.Header().Set("Www-Authenticate", fmt.Sprintf(`Bearer realm=%q, service="registry.example.com"`, registryURL+"/oauth2/token?ignored=true"))
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/oauth2/exchange":
+			http.Redirect(w, r, "/exchange", http.StatusTemporaryRedirect)
+		case "/exchange":
+			assert.NoError(t, r.ParseForm())
+			assert.Equal(t, "canary-only-token", r.Form.Get("access_token"))
+			assert.Empty(t, r.URL.RawQuery)
+			_, err := w.Write([]byte(`{"refresh_token":"refresh-canary"}`))
+			assert.NoError(t, err)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer registry.Close()
+	registryURL = registry.URL
+	provider := &mocks.TokenProvider{}
+	provider.EXPECT().GetToken("https://management.core.windows.net/.default").
+		Return(&workloadidentity.Token{AccessToken: "canary-only-token"}, nil).Once()
+	creds := NewAzureWorkloadIdentityCreds(strings.TrimPrefix(registry.URL, "https://")+"/charts", "", nil, nil, true, provider)
+	token, err := creds.GetAccessToken()
+	require.NoError(t, err)
+	assert.Equal(t, "refresh-canary", token)
+	provider.AssertExpectations(t)
+}
+
+func TestAzureRegistryMalformedChallenge(t *testing.T) {
+	t.Parallel()
+	for _, challenge := range []string{"Bearer", "Bearer realm", `Bearer realm="a",realm="b"`, `Bearer realm="a", service`} {
+		t.Run(challenge, func(t *testing.T) {
+			t.Parallel()
+			registry := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Www-Authenticate", challenge)
+				w.WriteHeader(http.StatusUnauthorized)
+			}))
+			defer registry.Close()
+			provider := &mocks.TokenProvider{}
+			creds := NewAzureWorkloadIdentityCreds(strings.TrimPrefix(registry.URL, "https://"), "", nil, nil, true, provider)
+			_, err := creds.GetAccessToken()
+			require.Error(t, err)
+		})
+	}
 }
 
 // Helper to generate a mock JWT token with a given expiry time

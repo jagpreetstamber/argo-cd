@@ -2748,7 +2748,7 @@ func Test_nativeGitClient_runCredentialedCmd(t *testing.T) {
 			creds: &mockCreds{
 				environ: []string{bearerAuthHeaderEnv + "=Bearer test-token"},
 			},
-			expectedArgs: []string{"--config-env", "http.extraHeader=" + bearerAuthHeaderEnv, "status"},
+			expectedArgs: []string{"--config-env", "http.https://example.com/.extraHeader=" + bearerAuthHeaderEnv, "status"},
 			expectedEnv:  []string{bearerAuthHeaderEnv + "=Bearer test-token"},
 			expectedErr:  false,
 		},
@@ -2775,7 +2775,8 @@ func Test_nativeGitClient_runCredentialedCmd(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &nativeGitClient{
-				creds: tt.creds,
+				creds:   tt.creds,
+				repoURL: "https://example.com/repo.git",
 			}
 			ctx := t.Context()
 
@@ -2797,6 +2798,85 @@ func Test_nativeGitClient_runCredentialedCmd(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCredentialedGitArgsBearerOrigin(t *testing.T) {
+	t.Parallel()
+	environ := []string{bearerAuthHeaderEnv + "=Authorization: Bearer canary"}
+	args, err := credentialedGitArgs("https://example.com/repo.git", []string{"config", "--get-urlmatch", "http.extraHeader"}, environ)
+	require.NoError(t, err)
+	for _, tt := range []struct {
+		url   string
+		match bool
+	}{
+		{"https://example.com/repo.git", true},
+		{"https://example.com/other.git", true},
+		{"https://example.com:443/other.git", true},
+		{"https://example.com.attacker.example/evil.git", false},
+		{"https://other.example/evil.git", false},
+		{"https://example.com:8443/evil.git", false},
+		{"http://example.com/evil.git", false},
+	} {
+		t.Run(tt.url, func(t *testing.T) {
+			t.Parallel()
+			cmd := exec.CommandContext(t.Context(), "git", append(append([]string{}, args...), tt.url)...)
+			cmd.Env = append(os.Environ(), environ...)
+			output, err := cmd.CombinedOutput()
+			if tt.match {
+				require.NoError(t, err, "%s", output)
+				assert.Equal(t, "Authorization: Bearer canary", strings.TrimSpace(string(output)))
+			} else {
+				require.Error(t, err)
+				assert.Empty(t, string(output))
+			}
+		})
+	}
+	_, err = credentialedGitArgs("ssh://git@example.com/repo.git", []string{"fetch"}, environ)
+	require.ErrorContains(t, err, "HTTP(S) repository URL")
+}
+
+func TestSubmoduleDoesNotReceiveParentBearer(t *testing.T) {
+	t.Parallel()
+	var requests, leaked atomic.Int32
+	foreign := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Header.Get("Authorization") != "" {
+			leaked.Add(1)
+		}
+		w.Header().Set("Www-Authenticate", `Basic realm="submodule"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer foreign.Close()
+	root := t.TempDir()
+	ctx := t.Context()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.name", "Test"},
+		{"config", "user.email", "test@example.com"},
+	} {
+		require.NoError(t, runCmd(ctx, root, "git", args...))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".gitmodules"), []byte(fmt.Sprintf("[submodule \"foreign\"]\n\tpath = foreign\n\turl = %s/repo.git\n", foreign.URL)), 0o600))
+	require.NoError(t, runCmd(ctx, root, "git", "add", ".gitmodules"))
+	require.NoError(t, runCmd(ctx, root, "git", "commit", "-m", "parent"))
+	head, err := outputCmd(ctx, root, "git", "rev-parse", "HEAD")
+	require.NoError(t, err)
+	require.NoError(t, runCmd(ctx, root, "git", "update-index", "--add", "--cacheinfo", "160000,"+strings.TrimSpace(string(head))+",foreign"))
+	require.NoError(t, runCmd(ctx, root, "git", "commit", "-m", "submodule"))
+	client := &nativeGitClient{
+		root:    root,
+		repoURL: "https://parent.example/repo.git",
+		creds: &mockCreds{environ: []string{
+			bearerAuthHeaderEnv + "=Authorization: Bearer canary-only-token",
+			"GIT_SSL_NO_VERIFY=true",
+			"GIT_CONFIG_GLOBAL=" + filepath.Join(t.TempDir(), "gitconfig"),
+			"XDG_CONFIG_HOME=" + t.TempDir(),
+		}},
+	}
+	err = client.runCredentialedCmd(ctx, "submodule", "update", "--init", "--recursive")
+	require.Error(t, err, "the foreign private submodule has no independent credentials")
+	assert.Positive(t, requests.Load())
+	assert.Zero(t, leaked.Load())
 }
 
 func Test_LsFiles_RaceCondition(t *testing.T) {

@@ -146,6 +146,42 @@ func TestSameURL(t *testing.T) {
 	}
 }
 
+func TestMatchCredentialURL(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, repo, credential string
+		match                  bool
+	}{
+		{"registry child", "registry.azurecr.io/charts/app", "registry.azurecr.io", true},
+		{"registry suffix", "registry.azurecr.io.attacker.example/charts/app", "registry.azurecr.io", false},
+		{"registry userinfo", "registry.azurecr.io@attacker.example/charts", "registry.azurecr.io", false},
+		{"OCI prefix", "oci://registry.azurecr.io/charts/app", "registry.azurecr.io/charts", true},
+		{"OCI template", "registry.azurecr.io/charts/app", "oci://registry.azurecr.io/charts", true},
+		{"path boundary", "https://example.com/team-evil/repo", "https://example.com/team", false},
+		{"child path", "https://example.com/team/repo.git", "https://example.com/team/", true},
+		{"exact repository", "https://example.com/team/repo.git", "https://example.com/team/repo", true},
+		{"case sensitive path", "https://example.com/Team/repo", "https://example.com/team", false},
+		{"hostname case", "https://EXAMPLE.com/team/repo", "https://example.com/team", true},
+		{"different scheme", "http://example.com/team", "https://example.com", false},
+		{"different port", "https://example.com:8443/team", "https://example.com", false},
+		{"default port", "https://example.com:443/team", "https://example.com", true},
+		{"path traversal", "https://example.com/team/../other", "https://example.com/team", false},
+		{"encoded traversal", "https://example.com/team/%2e%2e/other", "https://example.com/team", false},
+		{"SSH", "git@example.com:team/repo.git", "ssh://git@example.com/team", true},
+		{"SSH suffix", "git@example.com.attacker.example:team/repo", "git@example.com", false},
+		{"SSH port", "ssh://git@example.com:2222/team/repo", "ssh://git@example.com/team", false},
+		{"empty template", "https://example.com/team", "", false},
+		{"invalid template", "https://example.com/team", "https://[", false},
+		{"query template", "https://example.com/team", "https://example.com?team", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.match, MatchCredentialURL(tt.repo, tt.credential))
+		})
+	}
+}
+
 func TestSanitizeRepoURL(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

@@ -1092,14 +1092,7 @@ func (creds AzureWorkloadIdentityCreds) Environ() (io.Closer, []string, error) {
 	if err != nil {
 		return NopCloser{}, nil, err
 	}
-	nonce := creds.store.Add("", token)
-	env := creds.store.Environ(nonce)
-	env = append(env, fmt.Sprintf("%s=Authorization: Bearer %s", bearerAuthHeaderEnv, token))
-
-	return utilio.NewCloser(func() error {
-		creds.store.Remove(nonce)
-		return nil
-	}), env, nil
+	return NopCloser{}, []string{fmt.Sprintf("%s=Authorization: Bearer %s", bearerAuthHeaderEnv, token)}, nil
 }
 
 func (creds AzureWorkloadIdentityCreds) getAccessToken(scope string) (string, error) {
@@ -1203,14 +1196,7 @@ func (a AzureServicePrincipalCreds) Environ() (io.Closer, []string, error) {
 	if err != nil {
 		return NopCloser{}, nil, err
 	}
-	nonce := a.store.Add("", token)
-	env := a.store.Environ(nonce)
-	env = append(env, fmt.Sprintf("%s=Authorization: Bearer %s", bearerAuthHeaderEnv, token))
-
-	return utilio.NewCloser(func() error {
-		a.store.Remove(nonce)
-		return nil
-	}), env, nil
+	return NopCloser{}, []string{fmt.Sprintf("%s=Authorization: Bearer %s", bearerAuthHeaderEnv, token)}, nil
 }
 
 func (a AzureServicePrincipalCreds) getAccessToken() (string, error) {

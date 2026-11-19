@@ -2193,15 +2193,20 @@ func (m *nativeGitClient) runCmd(ctx context.Context, args ...string) (string, e
 	return m.runCmdOutput(cmd, runOpts{})
 }
 
-func credentialedGitArgs(args []string, environ []string) []string {
+func credentialedGitArgs(repoURL string, args []string, environ []string) ([]string, error) {
 	for _, e := range environ {
 		if strings.HasPrefix(e, forceBasicAuthHeaderEnv+"=") {
 			args = append([]string{"--config-env", "http.extraHeader=" + forceBasicAuthHeaderEnv}, args...)
 		} else if strings.HasPrefix(e, bearerAuthHeaderEnv+"=") {
-			args = append([]string{"--config-env", "http.extraHeader=" + bearerAuthHeaderEnv}, args...)
+			u, err := url.Parse(repoURL)
+			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
+				return nil, errors.New("bearer authentication requires an HTTP(S) repository URL")
+			}
+			origin := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}).String()
+			args = append([]string{"--config-env", "http." + origin + ".extraHeader=" + bearerAuthHeaderEnv}, args...)
 		}
 	}
-	return args
+	return args, nil
 }
 
 // runCredentialedCmd is a convenience function to run a git command with username/password credentials
@@ -2235,7 +2240,10 @@ func (m *nativeGitClient) runCredentialedCmdOutput(ctx context.Context, ropts ru
 	}
 	defer func() { _ = closer.Close() }()
 
-	args = credentialedGitArgs(args, environ)
+	args, err = credentialedGitArgs(m.repoURL, args, environ)
+	if err != nil {
+		return "", err
+	}
 
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Env = append(cmd.Env, environ...)

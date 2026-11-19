@@ -28,6 +28,7 @@ import (
 
 	argoio "github.com/argoproj/argo-cd/gitops-engine/v3/pkg/utils/io"
 
+	argoutils "github.com/argoproj/argo-cd/v3/util"
 	"github.com/argoproj/argo-cd/v3/util/cert"
 	utilio "github.com/argoproj/argo-cd/v3/util/io"
 	"github.com/argoproj/argo-cd/v3/util/workloadidentity"
@@ -587,12 +588,7 @@ func TestAzureWorkloadIdentityCreds_Environ(t *testing.T) {
 	creds := AzureWorkloadIdentityCreds{store, workloadIdentityMock}
 	_, env, err := creds.Environ()
 	require.NoError(t, err)
-	assert.Len(t, store.creds, 1)
-
-	for _, value := range store.creds {
-		assert.Empty(t, value.username)
-		assert.Equal(t, "accessToken", value.password)
-	}
+	assert.Empty(t, store.creds, "bearer tokens must not be available through URL-blind askpass")
 
 	require.Len(t, env, 1)
 	assert.Equal(t, "ARGOCD_GIT_BEARER_AUTH_HEADER=Authorization: Bearer accessToken", env[0], "ARGOCD_GIT_BEARER_AUTH_HEADER env var must be set")
@@ -606,9 +602,24 @@ func TestAzureWorkloadIdentityCreds_Environ_cleanup(t *testing.T) {
 	creds := AzureWorkloadIdentityCreds{store, workloadIdentityMock}
 	closer, _, err := creds.Environ()
 	require.NoError(t, err)
-	credsLenBefore := len(store.creds)
 	utilio.Close(closer)
-	assert.Len(t, store.creds, credsLenBefore-1)
+	assert.Empty(t, store.creds)
+}
+
+func TestAzureServicePrincipalCreds_Environ(t *testing.T) {
+	t.Parallel()
+	store := &memoryCredsStore{creds: make(map[string]cred)}
+	creds := NewAzureServicePrincipalCreds(t.Name(), "canary-client", "canary-secret", store)
+	key, err := argoutils.GenerateCacheKey("%s %s %s %s", creds.tenantID, creds.clientID, creds.clientSecret, "https://login.microsoftonline.com")
+	require.NoError(t, err)
+	azureServicePrincipalTokenCache.Set(key, "canary-only-token", time.Minute)
+	t.Cleanup(func() { azureServicePrincipalTokenCache.Delete(key) })
+
+	closer, environ, err := creds.Environ()
+	require.NoError(t, err)
+	defer utilio.Close(closer)
+	assert.Equal(t, []string{bearerAuthHeaderEnv + "=Authorization: Bearer canary-only-token"}, environ)
+	assert.Empty(t, store.creds, "bearer tokens must not be available through URL-blind askpass")
 }
 
 func TestAzureWorkloadIdentityCreds_GetUserInfo(t *testing.T) {

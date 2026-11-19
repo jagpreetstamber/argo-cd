@@ -1,9 +1,11 @@
 package git
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -88,6 +90,62 @@ func NormalizeGitURL(repo string) string {
 	}
 	normalized := repoURL.String()
 	return strings.TrimPrefix(normalized, "ssh://")
+}
+
+// MatchCredentialURL matches a repository against a credential's origin and path boundary.
+// Scheme-less OCI registry URLs and oci:// URLs use the HTTPS origin.
+func MatchCredentialURL(repoURL, credentialURL string) bool {
+	parse := func(raw string) (*url.URL, error) {
+		raw = strings.TrimSpace(raw)
+		if ssh, _ := IsSSHURL(raw); ssh {
+			raw = "ssh://" + strings.TrimPrefix(NormalizeGitURL(raw), "ssh://")
+		} else {
+			raw = strings.TrimPrefix(raw, "oci://")
+			if !strings.Contains(raw, "://") {
+				raw = "https://" + raw
+			}
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return nil, err
+		}
+		if u.Hostname() == "" || u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" || strings.Contains(u.Path, "\\") {
+			return nil, errors.New("invalid credential URL")
+		}
+		u.Path = strings.TrimSuffix(path.Clean("/"+strings.TrimPrefix(u.Path, "/")), ".git")
+		return u, nil
+	}
+	repo, err := parse(repoURL)
+	if err != nil {
+		return false
+	}
+	credential, err := parse(credentialURL)
+	if err != nil {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if u.Port() != "" {
+			return u.Port()
+		}
+		switch u.Scheme {
+		case "https":
+			return "443"
+		case "http":
+			return "80"
+		case "ssh":
+			return "22"
+		default:
+			return ""
+		}
+	}
+	if repo.Scheme != credential.Scheme || !strings.EqualFold(repo.Hostname(), credential.Hostname()) || port(repo) != port(credential) {
+		return false
+	}
+	if credential.User != nil && (repo.User == nil || repo.User.String() != credential.User.String()) {
+		return false
+	}
+	prefix := strings.TrimSuffix(credential.Path, "/")
+	return repo.Path == prefix || strings.HasPrefix(repo.Path, prefix+"/")
 }
 
 // IsSSHURL returns true if supplied URL is SSH URL

@@ -124,7 +124,11 @@ func NewAzureWorkloadIdentityCreds(repoURL string, caPath string, certData []byt
 }
 
 func (creds AzureWorkloadIdentityCreds) GetAccessToken() (string, error) {
-	registryHost, _, _ := strings.Cut(creds.repoURL, "/")
+	registryURL, err := creds.registryURL()
+	if err != nil {
+		return "", err
+	}
+	registryHost := registryURL.Host
 	ctx := context.Background()
 
 	// Compute hash as key for refresh token in the cache
@@ -181,18 +185,26 @@ func (creds AzureWorkloadIdentityCreds) getAccessTokenAfterChallenge(ctx context
 	realm := tokenParams["realm"]
 	service := tokenParams["service"]
 
+	registryURL, err := creds.registryURL()
+	if err != nil {
+		return "", err
+	}
+	parsedURL, err := url.Parse(realm)
+	if err != nil || parsedURL.User != nil || !sameRegistryOrigin(registryURL, parsedURL) {
+		return "", errors.New("Bearer realm must use the configured registry HTTPS origin")
+	}
+	registryURL.Path = "/oauth2/exchange"
+	refreshTokenURL := registryURL.String()
+
 	armTokenScope := env.StringFromEnv("AZURE_ARM_TOKEN_RESOURCE", "https://management.core.windows.net")
 	armAccessToken, err := creds.tokenProvider.GetToken(armTokenScope + "/.default")
 	if err != nil {
 		return "", fmt.Errorf("failed to get Azure access token: %w", err)
 	}
 
-	parsedURL, _ := url.Parse(realm)
-	parsedURL.Path = "/oauth2/exchange"
-	refreshTokenURL := parsedURL.String()
-
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout:       10 * time.Second,
+		CheckRedirect: registryRedirectPolicy(registryURL),
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: creds.GetInsecureSkipVerify(),
@@ -242,9 +254,14 @@ func (creds AzureWorkloadIdentityCreds) getAccessTokenAfterChallenge(ctx context
 
 func (creds AzureWorkloadIdentityCreds) challengeAzureContainerRegistry(ctx context.Context, azureContainerRegistry string) (map[string]string, error) {
 	requestURL := fmt.Sprintf("https://%s/v2/", azureContainerRegistry)
+	registryURL, err := creds.registryURL()
+	if err != nil {
+		return nil, err
+	}
 
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout:       10 * time.Second,
+		CheckRedirect: registryRedirectPolicy(registryURL),
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: creds.GetInsecureSkipVerify(),
@@ -269,17 +286,26 @@ func (creds AzureWorkloadIdentityCreds) challengeAzureContainerRegistry(ctx cont
 	}
 
 	authenticate := resp.Header.Get("Www-Authenticate")
-	tokens := strings.Split(authenticate, " ")
+	scheme, parameters, ok := strings.Cut(authenticate, " ")
 
-	if !strings.EqualFold(tokens[0], "bearer") {
-		return nil, fmt.Errorf("registry does not allow 'Bearer' authentication, got '%s'", tokens[0])
+	if !strings.EqualFold(scheme, "bearer") {
+		return nil, fmt.Errorf("registry does not allow 'Bearer' authentication, got '%s'", scheme)
+	}
+	if !ok {
+		return nil, errors.New("malformed Bearer challenge")
 	}
 
 	tokenParams := make(map[string]string)
 
-	for token := range strings.SplitSeq(tokens[1], ",") {
-		kvPair := strings.Split(token, "=")
-		tokenParams[kvPair[0]] = strings.Trim(kvPair[1], "\"")
+	for token := range strings.SplitSeq(parameters, ",") {
+		key, value, ok := strings.Cut(strings.TrimSpace(token), "=")
+		if !ok || key == "" || value == "" {
+			return nil, errors.New("malformed Bearer challenge parameter")
+		}
+		if _, exists := tokenParams[key]; exists {
+			return nil, errors.New("duplicate Bearer challenge parameter")
+		}
+		tokenParams[key] = strings.Trim(value, "\"")
 	}
 
 	if _, realmExists := tokenParams["realm"]; !realmExists {
@@ -290,5 +316,40 @@ func (creds AzureWorkloadIdentityCreds) challengeAzureContainerRegistry(ctx cont
 		return nil, errors.New("service parameter not found in challenge")
 	}
 
+	realm, err := url.Parse(tokenParams["realm"])
+	if err != nil || realm.User != nil || !sameRegistryOrigin(registryURL, realm) {
+		return nil, errors.New("Bearer realm must use the configured registry HTTPS origin")
+	}
+
 	return tokenParams, nil
+}
+
+func (creds AzureWorkloadIdentityCreds) registryURL() (*url.URL, error) {
+	u, err := url.Parse("https://" + strings.TrimPrefix(creds.repoURL, "oci://"))
+	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("invalid Azure Container Registry URL")
+	}
+	return &url.URL{Scheme: "https", Host: u.Host}, nil
+}
+
+func sameRegistryOrigin(registry, target *url.URL) bool {
+	port := func(u *url.URL) string {
+		if u.Port() == "" {
+			return "443"
+		}
+		return u.Port()
+	}
+	return target.Scheme == "https" && strings.EqualFold(registry.Hostname(), target.Hostname()) && port(registry) == port(target)
+}
+
+func registryRedirectPolicy(registry *url.URL) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if req.URL.User != nil || !sameRegistryOrigin(registry, req.URL) {
+			return errors.New("registry redirect must retain the configured HTTPS origin")
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 registry redirects")
+		}
+		return nil
+	}
 }

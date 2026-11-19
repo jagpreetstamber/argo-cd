@@ -1202,15 +1202,10 @@ func getHelmRepos(appPath string, repositories []*v1alpha1.Repository, helmRepoC
 				repo.UseAzureWorkloadIdentity = repositoryCredential.UseAzureWorkloadIdentity
 				repo.InsecureOCIForceHttp = repositoryCredential.InsecureOCIForceHttp
 			} else if repo.EnableOCI {
-				// finally if repo is OCI and no credentials found, use the first OCI credential matching by hostname
+				// Finally, use an OCI repository credential whose origin and path scope include the dependency.
 				// see https://github.com/argoproj/argo-cd/issues/14636
 				for _, cred := range repositories {
-					if _, err = url.Parse("oci://" + dep.Repo); err != nil {
-						continue
-					}
-					// if the repo is OCI, don't match the repository URL exactly, but only as a dependent repository prefix just like in the getRepoCredential function
-					// see https://github.com/argoproj/argo-cd/issues/12436
-					if cred.EnableOCI && (strings.HasPrefix(dep.Repo, cred.Repo) || strings.HasPrefix(cred.Repo, dep.Repo)) || (cred.Type == "oci" && (strings.HasPrefix("oci://"+dep.Repo, cred.Repo) || strings.HasPrefix(cred.Repo, "oci://"+dep.Repo))) {
+					if (cred.EnableOCI || cred.Type == "oci") && git.MatchCredentialURL(dep.Repo, cred.Repo) {
 						repo.Username = cred.Username
 						repo.Password = cred.Password
 						repo.UseAzureWorkloadIdentity = cred.UseAzureWorkloadIdentity
@@ -1663,12 +1658,10 @@ func getReferencedSource(rawValueFile string, refSources map[string]*v1alpha1.Re
 
 func getRepoCredential(repoCredentials []*v1alpha1.RepoCreds, repoURL string) *v1alpha1.RepoCreds {
 	for _, cred := range repoCredentials {
-		if cred.Type != "oci" {
-			if strings.HasPrefix(strings.TrimPrefix(repoURL, ociPrefix), cred.URL) {
-				return cred
+		if git.MatchCredentialURL(repoURL, cred.URL) {
+			if cred.Type == "oci" {
+				cred.EnableOCI = true
 			}
-		} else if strings.HasPrefix(ociPrefix+repoURL, cred.URL) {
-			cred.EnableOCI = true
 			return cred
 		}
 	}
